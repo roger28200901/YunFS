@@ -56,7 +56,10 @@ static size_t calculate_serialized_size(vfs_node_t *node) {
     size += sizeof(time_t) * 2;                /* mtime, ctime */
     
     if (node->type == VFS_FILE) {
-        size += node->size;                    /* 檔案內容 */
+        /* 檔案：只有在有資料時才計算大小 */
+        if (node->data != NULL && node->size > 0) {
+            size += node->size;                    /* 檔案內容 */
+        }
     } else {
         /* 目錄：遞迴計算子節點 */
         size += sizeof(uint32_t);              /* 子節點數量 */
@@ -90,7 +93,9 @@ static size_t serialize_node(vfs_node_t *node, uint8_t *buffer, size_t buffer_si
     
     /* 寫入節點類型 */
     if (offset + sizeof(uint32_t) > buffer_size) return offset;
-    *(uint32_t *)(buffer + offset) = (uint32_t)node->type;
+    /* 注意：vfs_node_type_t 目前 VFS_FILE == 0，與 NULL 標記衝突。
+     * 因此序列化時統一寫入 (type + 1)，保留 0 給 NULL。 */
+    *(uint32_t *)(buffer + offset) = (uint32_t)node->type + 1;
     offset += sizeof(uint32_t);
     
     /* 寫入名稱長度與名稱 */
@@ -115,8 +120,8 @@ static size_t serialize_node(vfs_node_t *node, uint8_t *buffer, size_t buffer_si
     
     if (node->type == VFS_FILE) {
         /* 寫入檔案內容 */
-        if (offset + node->size > buffer_size) return offset;
         if (node->data != NULL && node->size > 0) {
+            if (offset + node->size > buffer_size) return offset;
             memcpy(buffer + offset, node->data, node->size);
             offset += node->size;
         }
@@ -156,7 +161,10 @@ static size_t serialize_node(vfs_node_t *node, uint8_t *buffer, size_t buffer_si
  * @return 重建的節點，失敗回傳 NULL
  */
 static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, size_t *offset, vfs_node_t *parent) {
-    if (*offset + sizeof(uint32_t) > buffer_size) return NULL;
+    if (*offset + sizeof(uint32_t) > buffer_size) {
+        error_set(ERR_INVALID_INPUT, "反序列化時緩衝區超出範圍 (offset=%zu, buffer_size=%zu)", *offset, buffer_size);
+        return NULL;
+    }
     
     /* 讀取類型標記 */
     uint32_t type_marker = *(uint32_t *)(buffer + *offset);
@@ -165,17 +173,32 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
     if (type_marker == 0) {
         return NULL;  /* NULL 節點 */
     }
-    
+
+    /* 反序列化時回復 type = (marker - 1) */
+    type_marker -= 1;
+    if (type_marker > (uint32_t)VFS_DIR) {
+        error_set(ERR_INVALID_INPUT, "反序列化時節點類型無效: %u", (unsigned)(type_marker + 1));
+        return NULL;
+    }
     vfs_node_type_t type = (vfs_node_type_t)type_marker;
     
     /* 讀取名稱 */
-    if (*offset + sizeof(uint32_t) > buffer_size) return NULL;
+    if (*offset + sizeof(uint32_t) > buffer_size) {
+        error_set(ERR_INVALID_INPUT, "反序列化時名稱長度欄位超出緩衝區範圍 (offset=%zu, buffer_size=%zu)", *offset, buffer_size);
+        return NULL;
+    }
     uint32_t name_len = *(uint32_t *)(buffer + *offset);
     *offset += sizeof(uint32_t);
     
-    if (*offset + name_len + 1 > buffer_size) return NULL;
+    if (*offset + name_len + 1 > buffer_size) {
+        error_set(ERR_INVALID_INPUT, "反序列化時名稱長度超出緩衝區範圍 (name_len=%u, offset=%zu, buffer_size=%zu)", name_len, *offset, buffer_size);
+        return NULL;
+    }
     char *name = (char *)safe_malloc(name_len + 1);
-    if (name == NULL) return NULL;
+    if (name == NULL) {
+        error_set(ERR_MEMORY, "無法配置記憶體來讀取節點名稱");
+        return NULL;
+    }
     memcpy(name, buffer + *offset, name_len + 1);
     *offset += name_len + 1;
     
@@ -183,6 +206,7 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
     vfs_node_t *node = (vfs_node_t *)safe_malloc(sizeof(vfs_node_t));
     if (node == NULL) {
         safe_free(name);
+        error_set(ERR_MEMORY, "無法配置記憶體來建立節點");
         return NULL;
     }
     
@@ -196,6 +220,7 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
     if (*offset + sizeof(size_t) > buffer_size) {
         safe_free(node->name);
         safe_free(node);
+        error_set(ERR_INVALID_INPUT, "反序列化時大小欄位超出緩衝區範圍");
         return NULL;
     }
     node->size = *(size_t *)(buffer + *offset);
@@ -205,6 +230,7 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
     if (*offset + sizeof(time_t) * 2 > buffer_size) {
         safe_free(node->name);
         safe_free(node);
+        error_set(ERR_INVALID_INPUT, "反序列化時時間戳記超出緩衝區範圍");
         return NULL;
     }
     node->mtime = *(time_t *)(buffer + *offset);
@@ -219,12 +245,14 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
                 safe_free(node->name);
                 if (node->data) safe_free(node->data);
                 safe_free(node);
+                error_set(ERR_INVALID_INPUT, "反序列化時檔案內容超出緩衝區範圍 (size=%zu, offset=%zu, buffer_size=%zu)", node->size, *offset, buffer_size);
                 return NULL;
             }
             node->data = safe_malloc(node->size);
             if (node->data == NULL) {
                 safe_free(node->name);
                 safe_free(node);
+                error_set(ERR_MEMORY, "無法配置記憶體來讀取檔案內容");
                 return NULL;
             }
             memcpy(node->data, buffer + *offset, node->size);
@@ -237,6 +265,7 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
         if (*offset + sizeof(uint32_t) > buffer_size) {
             safe_free(node->name);
             safe_free(node);
+            error_set(ERR_INVALID_INPUT, "反序列化時子節點數量超出緩衝區範圍");
             return NULL;
         }
         uint32_t child_count = *(uint32_t *)(buffer + *offset);
@@ -257,6 +286,7 @@ static vfs_node_t *deserialize_node(const uint8_t *buffer, size_t buffer_size, s
                 }
                 safe_free(node->name);
                 safe_free(node);
+                /* 錯誤訊息已經由 deserialize_node 設定，直接回傳 */
                 return NULL;
             }
             
@@ -374,6 +404,7 @@ vfs_t *vfs_load_encrypted(const char *filename, const char *key) {
     uint8_t *encrypted = (uint8_t *)safe_malloc(encrypted_size);
     if (encrypted == NULL) {
         fclose(file);
+        error_set(ERR_MEMORY, "無法配置記憶體來讀取加密資料");
         return NULL;
     }
     
@@ -390,6 +421,7 @@ vfs_t *vfs_load_encrypted(const char *filename, const char *key) {
     uint8_t *decrypted = (uint8_t *)safe_malloc(encrypted_size);
     if (decrypted == NULL) {
         safe_free(encrypted);
+        error_set(ERR_MEMORY, "無法配置記憶體來解密資料");
         return NULL;
     }
     
@@ -428,6 +460,7 @@ vfs_t *vfs_load_encrypted(const char *filename, const char *key) {
     if (vfs == NULL) {
         secure_zero(decrypted, encrypted_size);
         safe_free(decrypted);
+        error_set(ERR_MEMORY, "無法配置記憶體來建立 VFS 結構");
         return NULL;
     }
     
@@ -437,6 +470,7 @@ vfs_t *vfs_load_encrypted(const char *filename, const char *key) {
         secure_zero(decrypted, encrypted_size);
         safe_free(decrypted);
         safe_free(vfs);
+        error_set(ERR_INVALID_INPUT, "無法反序列化 VFS 資料（檔案可能損壞或格式錯誤）");
         return NULL;
     }
     

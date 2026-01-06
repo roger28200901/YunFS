@@ -66,31 +66,169 @@ char *sanitize_path(const char *path) {
  * ======================================================================== */
 
 /**
+ * @brief 解析並規範化路徑中的 ../ 和 ./
+ * @param path 原始路徑
+ * @return 規範化後的路徑，需由呼叫者釋放，失敗回傳 NULL
+ */
+static char *resolve_dot_dot(const char *path) {
+    if (path == NULL) {
+        return NULL;
+    }
+    
+    size_t len = strlen(path);
+    if (len == 0) {
+        return safe_strdup("");
+    }
+    
+    /* 使用陣列模擬堆疊來處理路徑組件 */
+    char **components = (char **)safe_malloc(sizeof(char *) * (len + 1));
+    if (components == NULL) {
+        return NULL;
+    }
+    
+    size_t component_count = 0;
+    const char *start = path;
+    bool is_absolute = (path[0] == '/');
+    
+    /* 如果是絕對路徑，跳過開頭的斜線 */
+    if (is_absolute) {
+        start++;
+    }
+    
+    /* 分割路徑為組件 */
+    const char *p = start;
+    while (*p != '\0') {
+        /* 跳過斜線 */
+        while (*p == '/') p++;
+        if (*p == '\0') break;
+        
+        const char *comp_start = p;
+        while (*p != '\0' && *p != '/') p++;
+        
+        size_t comp_len = p - comp_start;
+        if (comp_len == 0) continue;
+        
+        /* 處理 "." 組件（忽略） */
+        if (comp_len == 1 && comp_start[0] == '.') {
+            continue;
+        }
+        
+        /* 處理 ".." 組件 */
+        if (comp_len == 2 && comp_start[0] == '.' && comp_start[1] == '.') {
+            if (component_count > 0) {
+                /* 移除上一個組件（回到上一層） */
+                safe_free(components[component_count - 1]);
+                component_count--;
+            } else if (!is_absolute) {
+                /* 相對路徑且已經在根目錄，保留 ".." */
+                components[component_count] = safe_strndup(comp_start, comp_len);
+                if (components[component_count] == NULL) {
+                    /* 清理已分配的組件 */
+                    for (size_t i = 0; i < component_count; i++) {
+                        safe_free(components[i]);
+                    }
+                    safe_free(components);
+                    return NULL;
+                }
+                component_count++;
+            }
+            /* 絕對路徑且 component_count == 0，忽略（已經在根目錄） */
+            continue;
+        }
+        
+        /* 一般組件 */
+        components[component_count] = safe_strndup(comp_start, comp_len);
+        if (components[component_count] == NULL) {
+            /* 清理已分配的組件 */
+            for (size_t i = 0; i < component_count; i++) {
+                safe_free(components[i]);
+            }
+            safe_free(components);
+            return NULL;
+        }
+        component_count++;
+    }
+    
+    /* 構建規範化後的路徑 */
+    size_t result_len = is_absolute ? 1 : 0;  /* 開頭的斜線 */
+    for (size_t i = 0; i < component_count; i++) {
+        result_len += strlen(components[i]) + 1;  /* 組件 + 斜線 */
+    }
+    
+    char *result = (char *)safe_malloc(result_len + 1);
+    if (result == NULL) {
+        for (size_t i = 0; i < component_count; i++) {
+            safe_free(components[i]);
+        }
+        safe_free(components);
+        return NULL;
+    }
+    
+    size_t offset = 0;
+    if (is_absolute) {
+        result[offset++] = '/';
+    }
+    
+    for (size_t i = 0; i < component_count; i++) {
+        if (i > 0 || is_absolute) {
+            result[offset++] = '/';
+        }
+        size_t comp_len = strlen(components[i]);
+        memcpy(result + offset, components[i], comp_len);
+        offset += comp_len;
+        safe_free(components[i]);
+    }
+    
+    result[offset] = '\0';
+    safe_free(components);
+    
+    return result;
+}
+
+/**
  * @brief 檢查路徑是否包含路徑遍歷攻擊
+ * 
+ * 此函式會先解析路徑中的 ../ 和 ./，然後檢查最終路徑是否超出根目錄。
+ * 只有在路徑會超出根目錄時才認為是攻擊。
  */
 bool is_path_traversal(const char *path) {
     if (path == NULL) {
         return false;
     }
     
-    /* 檢查 "../" 模式 */
-    if (strstr(path, "../") != NULL) {
-        error_set(ERR_PATH_TRAVERSAL, "路徑包含路徑遍歷攻擊: %s", path);
+    /* 先解析路徑中的 ../ 和 ./ */
+    char *resolved = resolve_dot_dot(path);
+    if (resolved == NULL) {
+        /* 解析失敗，可能是記憶體問題，保守起見認為是攻擊 */
+        error_set(ERR_PATH_TRAVERSAL, "路徑解析失敗: %s", path);
         return true;
     }
     
-    /* 檢查以 ".." 開頭的情況 */
-    if (strncmp(path, "..", 2) == 0 && (path[2] == '/' || path[2] == '\0')) {
-        error_set(ERR_PATH_TRAVERSAL, "路徑以 .. 開頭: %s", path);
+    /* 檢查解析後的路徑是否超出根目錄 */
+    /* 如果路徑以 ../ 開頭（相對路徑），或包含 ../，則認為是攻擊 */
+    if (strncmp(resolved, "../", 3) == 0 || strstr(resolved, "../") != NULL) {
+        error_set(ERR_PATH_TRAVERSAL, "路徑超出根目錄: %s", path);
+        safe_free(resolved);
         return true;
     }
     
-    /* 檢查 "/../" 模式 */
-    if (strstr(path, "/../") != NULL) {
-        error_set(ERR_PATH_TRAVERSAL, "路徑包含 /../: %s", path);
+    /* 檢查是否以 .. 結尾（且不是根目錄） */
+    size_t len = strlen(resolved);
+    if (len >= 2 && resolved[len - 2] == '.' && resolved[len - 1] == '.' && 
+        (len == 2 || resolved[len - 3] == '/')) {
+        error_set(ERR_PATH_TRAVERSAL, "路徑超出根目錄: %s", path);
+        safe_free(resolved);
         return true;
     }
     
+    /* 絕對路徑必須以 / 開頭 */
+    if (path[0] == '/' && resolved[0] != '/') {
+        error_set(ERR_PATH_TRAVERSAL, "路徑解析後超出根目錄: %s", path);
+        safe_free(resolved);
+        return true;
+    }
+    
+    safe_free(resolved);
     return false;
 }
 

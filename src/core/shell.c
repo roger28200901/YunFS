@@ -202,9 +202,13 @@ shell_t *shell_create(void) {
                     // 密碼正確，嘗試載入 VFS
                     shell->vfs = vfs_load_encrypted(VFS_DATA_FILE, password);
                     if (shell->vfs == NULL) {
-                        // 載入失敗（可能是檔案損壞）
+                        // 載入失敗，顯示具體錯誤訊息
+                        error_t err = error_get();
+                        printf("錯誤: 無法載入 VFS 資料\n");
+                        if (err.code != ERR_OK) {
+                            printf("  原因: %s\n", err.message);
+                        }
                         error_clear();
-                        printf("錯誤: 無法載入 VFS 資料（檔案可能損壞）\n");
                         safe_free(shell);
                         return NULL;
                     } else {
