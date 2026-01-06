@@ -11,6 +11,7 @@
 #include "shell_completion.h"
 #include "../filesystem/vfs.h"
 #include "../filesystem/vfs_persist.h"
+#include "../filesystem/fileops.h"
 #include "../utils/memory.h"
 #include "../utils/error.h"
 #include "../ui/splash.h"
@@ -18,6 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 /* ============================================================================
  * 私有常數定義
@@ -77,6 +82,100 @@ static const cmd_entry_t cmd_table[] = {
 };
 
 /* ============================================================================
+ * 內部輔助函式
+ * ============================================================================ */
+
+/**
+ * @brief 讀取密碼（隱藏輸入）
+ * @param password 輸出緩衝區
+ * @param size 緩衝區大小
+ * @return true 成功，false 失敗
+ */
+static bool read_password(char *password, size_t size) {
+    if (password == NULL || size == 0) {
+        return false;
+    }
+    
+#if defined(__unix__) || defined(__APPLE__)
+    // Unix/Linux/macOS 系統：關閉 echo 來隱藏輸入
+    struct termios old_term, new_term;
+    if (tcgetattr(STDIN_FILENO, &old_term) != 0) {
+        return false;
+    }
+    
+    new_term = old_term;
+    new_term.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL);
+    
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0) {
+        return false;
+    }
+    
+    // 讀取密碼
+    if (fgets(password, size, stdin) == NULL) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+        return false;
+    }
+    
+    // 恢復終端設定
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+#else
+    // 其他系統：直接讀取（不隱藏）
+    if (fgets(password, size, stdin) == NULL) {
+        return false;
+    }
+#endif
+    
+    // 移除換行字元
+    size_t len = strlen(password);
+    if (len > 0 && password[len - 1] == '\n') {
+        password[len - 1] = '\0';
+    }
+    
+    return true;
+}
+
+/**
+ * @brief 詢問使用者是否要載入現有的 VFS 資料
+ * @return true 要載入，false 不載入
+ */
+static bool ask_load_existing_data(void) {
+    char response[16];
+    
+    printf("偵測到現有的 VFS 資料檔案 (.yunfs_data)\n");
+    printf("是否要載入現有資料？(y/n): ");
+    fflush(stdout);
+    
+    if (fgets(response, sizeof(response), stdin) == NULL) {
+        return false;
+    }
+    
+    // 移除換行字元
+    size_t len = strlen(response);
+    if (len > 0 && response[len - 1] == '\n') {
+        response[len - 1] = '\0';
+    }
+    
+    // 轉換為小寫並檢查
+    for (size_t i = 0; response[i]; i++) {
+        response[i] = tolower(response[i]);
+    }
+    
+    return (strcmp(response, "y") == 0 || strcmp(response, "yes") == 0);
+}
+
+/**
+ * @brief 驗證密碼
+ * @param input_password 使用者輸入的密碼
+ * @return true 密碼正確，false 密碼錯誤
+ */
+static bool verify_password(const char *input_password) {
+    if (input_password == NULL) {
+        return false;
+    }
+    return (strcmp(input_password, ENCRYPTION_KEY) == 0);
+}
+
+/* ============================================================================
  * Shell 生命週期管理
  * ============================================================================ */
 
@@ -86,16 +185,56 @@ shell_t *shell_create(void) {
         return NULL;
     }
     
-    // 嘗試從持久化檔案載入 VFS（加密格式）
-    shell->vfs = vfs_load_encrypted(VFS_DATA_FILE, ENCRYPTION_KEY);
-    if (shell->vfs == NULL) {
-        // 載入失敗，創建新的空 VFS
-        error_clear();
-        shell->vfs = vfs_init();
-        if (shell->vfs == NULL) {
-            safe_free(shell);
-            return NULL;
+    // 檢查是否存在 .yunfs_data 檔案
+    bool data_file_exists = fileops_exists(VFS_DATA_FILE);
+    
+    if (data_file_exists) {
+        // 檔案存在，詢問使用者是否要載入
+        if (ask_load_existing_data()) {
+            // 要求輸入密碼
+            char password[256];
+            printf("請輸入密碼: ");
+            fflush(stdout);
+            
+            if (read_password(password, sizeof(password))) {
+                // 驗證密碼
+                if (verify_password(password)) {
+                    // 密碼正確，嘗試載入 VFS
+                    shell->vfs = vfs_load_encrypted(VFS_DATA_FILE, password);
+                    if (shell->vfs == NULL) {
+                        // 載入失敗（可能是檔案損壞）
+                        error_clear();
+                        printf("錯誤: 無法載入 VFS 資料（檔案可能損壞）\n");
+                        safe_free(shell);
+                        return NULL;
+                    } else {
+                        printf("成功載入 VFS 資料\n");
+                    }
+                } else {
+                    // 密碼錯誤，拒絕進入
+                    printf("密碼錯誤，拒絕存取。\n");
+                    safe_free(shell);
+                    return NULL;
+                }
+            } else {
+                // 讀取密碼失敗
+                printf("錯誤: 讀取密碼失敗\n");
+                safe_free(shell);
+                return NULL;
+            }
+        } else {
+            // 使用者選擇不載入，創建新的 VFS
+            shell->vfs = vfs_init();
         }
+    } else {
+        // 檔案不存在，直接創建新的 VFS
+        shell->vfs = vfs_init();
+    }
+    
+    // 檢查 VFS 初始化是否成功
+    if (shell->vfs == NULL) {
+        safe_free(shell);
+        return NULL;
     }
     
     // 初始化 Shell 狀態
